@@ -1,20 +1,21 @@
 // ============================================================================
-// Stage 1: gemm_base — 最朴素版本
-//   128 thread/CTA (4 warps, 2x2 布局), m16n8k16, fp16 累加
-//   CTA tile = 128x128, K-tile BK=32, 与最终版 v12 的 tiling 完全一致
+// 实验: gemm_base_multistage — base 只加 multistage 流水
+//   研究问题: 在 gemm_base 基础上单独引入 cp.async 多级流水, 能不能提速?
 //
-// 本阶段刻意"什么都不做"，作为演进的起点，三个最明显的问题：
-//   1) 不使用 multistage : 每个 K-tile 都是
-//      "cp.async 装载 -> wait -> __syncthreads -> 计算 -> __syncthreads"
-//      串行流水，global->shared 的拷贝延迟完全暴露，无法与计算重叠。
-//   2) 不解决 bank conflict: shared 直接行优先排布，无 swizzle。
-//      行宽 64B = 16 word，行 r 与 r+2 落同一 16-bank 半区，
-//      ldmatrix 读 8 行时 0&4、2&6 撞 bank，2-way 冲突。
-//   3) 不做写回的合并访存: epilogue 直接按 mma fragment 布局逐个
-//      写 2 个 fp16 (4B)，同一 warp 内相邻线程写相邻但错位的 4B,
-//      全局写回不合并，浪费 128B 事务。
+//   与 gemm_base 的对照:
+//     - compute (ldmatrix + mma) 逐字节相同
+//     - epilogue (朴素直接写回, 不合并) 逐字节相同
+//     - 无 swizzle (smem 线性排布)
+//     - 无寄存器双缓冲 (每个 kk 现场装载 fragment, 装完就算)
+//     唯一区别: 装载从"单缓冲 + wait_all"换成"3-stage cp.async 流水",
+//     提前 NUM_STAGES-1 个 K-tile 发出拷贝, wait_group 1 延迟等待,
+//     让 global->shared 拷贝延迟与当前 tile 的 mma 计算重叠。
 //
-// 校验数据: A[i][k]=2^(i%4)∈{1,2,4,8}, B[k][n]=1 => C[i][n]=4096*2^(i%4)
+//   代价: smem 16KB -> 48KB (3 个 stage), 块/SM 由 4 掉到 2 (smem 限制)。
+//   理论上流水藏住了 global 延迟, 但占用率减半 + ldmatrix 延迟裸露。
+//   实测见下方 main 输出。
+//
+// 编译: $NVCC -arch=sm_89 -O3 gemm_base_multistage.cu -o build_gemm_base_multistage
 // ============================================================================
 
 #include <cstdio>
@@ -25,71 +26,108 @@
 #define M 4096
 #define N 4096
 #define K 4096
-#define BM 128   // CTA tile 行
-#define BN 128   // CTA tile 列
-#define BK 32    // K tile (2 次 m16n8k16), 与 v12 一致
-#define NUM_KK (BK / 16)   // 2
-#define CHUNKS (BK / 8)    // 4 个 16B chunk / 行
+#define BM 128
+#define BN 128
+#define BK 32
+#define NUM_KK (BK / 16)
+#define CHUNKS (BK / 8)
+#define NUM_STAGES 3
+#define CHUNKS_PER_THREAD (BM * CHUNKS / 128)
 
-__device__ __forceinline__ void cp_async_16(void* smem_dst, const void* gmem_src)
+__device__ __forceinline__ void cp_async_16(uint32_t smem_dst, const void* gmem_src)
 {
-    unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
-                 :: "r"(s), "l"(gmem_src) : "memory");
+                 :: "r"(smem_dst), "l"(gmem_src) : "memory");
 }
 __device__ __forceinline__ void cp_async_commit_group() { asm volatile("cp.async.commit_group;"); }
 __device__ __forceinline__ void cp_async_wait_all()     { asm volatile("cp.async.wait_group 0;"); }
+__device__ __forceinline__ void cp_async_wait_near()    { asm volatile("cp.async.wait_group 1;"); }
 
 __global__ void gemm_amper(const half* __restrict__ gA,   // [M][K]
                            const half* __restrict__ gBT,  // [N][K] (B 转置)
                            half* __restrict__ gC)         // [M][N]
 {
-    __shared__ alignas(128) half sA[BM][BK];   // 128x32 = 8KB, 行 stride 64B (无 swizzle)
-    __shared__ alignas(128) half sB[BN][BK];   // 8KB
+    extern __shared__ __align__(128) half smem_buf[];
+    half* const sA_stages = smem_buf;
+    half* const sB_stages = smem_buf + NUM_STAGES * BM * BK;
+
     const int tid   = threadIdx.x;
     const int lane  = tid % 32;
     const int mwarp = (tid / 32) / 2;
     const int nwarp = (tid / 32) % 2;
     const int M0 = blockIdx.y * BM;
     const int N0 = blockIdx.x * BN;
+    const int NUM_K = K / BK;
 
     uint32_t C[4][8][2] = {};
 
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        // ---------- 1) 单缓冲装载 ----------
-        for (int i = tid; i < BM * CHUNKS; i += 128) {
-            int row   = i / CHUNKS;
-            int chunk = i % CHUNKS;
-            cp_async_16(&sA[row][chunk * 8], &gA[(M0 + row) * K + k0 + chunk * 8]);
-            cp_async_16(&sB[row][chunk * 8], &gBT[(N0 + row) * K + k0 + chunk * 8]);
+    // per-thread cp.async 源指针 (k0=0 base, 含 M0/N0 偏移)
+    const half* srcA[CHUNKS_PER_THREAD];
+    const half* srcB[CHUNKS_PER_THREAD];
+    #pragma unroll
+    for (int idx = 0; idx < CHUNKS_PER_THREAD; ++idx) {
+        const int i     = tid + idx * 128;
+        const int row   = i / CHUNKS;
+        const int chunk = i % CHUNKS;
+        srcA[idx] = &gA[(M0 + row) * K] + chunk * 8;
+        srcB[idx] = &gBT[(N0 + row) * K] + chunk * 8;
+    }
+
+    const uint32_t sA0 = (uint32_t)__cvta_generic_to_shared(sA_stages);
+    const uint32_t sB0 = (uint32_t)__cvta_generic_to_shared(sB_stages);
+    constexpr uint32_t STAGE_BYTES = BM * BK * 2;
+
+    // 发出一个 K-tile 的 global->shared 拷贝到 stage st (无 swizzle, 与 base 同布局)
+    auto issue_load = [&](int st, int k_tile) {
+        const uint32_t dA = sA0 + st * STAGE_BYTES;
+        const uint32_t dB = sB0 + st * STAGE_BYTES;
+        const int k0 = k_tile * BK;
+        #pragma unroll
+        for (int idx = 0; idx < CHUNKS_PER_THREAD; ++idx) {
+            const int i     = tid + idx * 128;
+            const int row   = i / CHUNKS;
+            const int chunk = i % CHUNKS;
+            cp_async_16(dA + (uint32_t)(row * BK + chunk * 8) * 2, srcA[idx] + k0);
+            cp_async_16(dB + (uint32_t)(row * BK + chunk * 8) * 2, srcB[idx] + k0);
         }
         cp_async_commit_group();
-        cp_async_wait_all();   // 等全部拷贝完成 (延迟暴露)
+    };
+
+    // Prologue: 提前 issue 前 NUM_STAGES-1 个 K-tile, 流水填满
+    #pragma unroll
+    for (int s = 0; s < NUM_STAGES - 1; ++s) issue_load(s, s);
+    cp_async_wait_near();   // 等最早的组 (tile 0) 到, 保留最新一组在途
+    __syncthreads();
+
+    for (int k_tile = 0; k_tile < NUM_K; ++k_tile) {
+        const int cur_stage = k_tile % NUM_STAGES;
+        // issue 下一批: tile k_tile + (NUM_STAGES-1) 进刚被释放的 stage
+        const int nk = k_tile + (NUM_STAGES - 1);
+        if (nk < NUM_K) issue_load(nk % NUM_STAGES, nk);
+        cp_async_wait_near();   // 等本 tile 的组完成 (它是当前最旧的)
         __syncthreads();
 
-        // ---------- 2) 计算: BK=32 内 2 个 m16n8k16 ----------
+        // ---------- 计算: 与 base 逐字节相同, 只把 smem 基址加上 stage 偏移 ----------
+        const uint32_t baseA = sA0 + cur_stage * STAGE_BYTES;
+        const uint32_t baseB = sB0 + cur_stage * STAGE_BYTES;
+        #pragma unroll
         for (int kk = 0; kk < NUM_KK; ++kk) {
             const int kslice = kk * 16;
             const int grp    = lane >> 3;
-            // A 片段: 4 个 8x8 象限, ldmatrix.x4
             uint32_t aFrag[4][4];
-            const uint32_t baseA = (uint32_t)__cvta_generic_to_shared(&sA[0][0]);
             #pragma unroll
             for (int mt = 0; mt < 4; ++mt) {
                 const int fr   = mwarp * 64 + mt * 16;
                 const int mOff = (grp & 1) * 8;
                 const int kOff = (grp >> 1) * 8;
                 const int row  = fr + mOff + (lane & 7);
-                // 无 swizzle: 物理列 = 逻辑列
                 const uint32_t addr = baseA + (uint32_t)row * (BK * 2) + (uint32_t)(kslice + kOff) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                              : "=r"(aFrag[mt][0]), "=r"(aFrag[mt][1]),
                                "=r"(aFrag[mt][2]), "=r"(aFrag[mt][3])
                              : "r"(addr));
             }
-            // B 片段: 8 个 n-tile, 4 次 ldmatrix.x4
             uint32_t bFrag[8][2];
-            const uint32_t baseB = (uint32_t)__cvta_generic_to_shared(&sB[0][0]);
             #pragma unroll
             for (int g = 0; g < 4; ++g) {
                 const int fr   = nwarp * 64 + g * 16;
@@ -104,7 +142,6 @@ __global__ void gemm_amper(const half* __restrict__ gA,   // [M][K]
                 bFrag[2 * g][0] = t0; bFrag[2 * g][1] = t1;
                 bFrag[2 * g + 1][0] = t2; bFrag[2 * g + 1][1] = t3;
             }
-            // mma 累加: 4x8 个 m16n8k16
             #pragma unroll
             for (int mt = 0; mt < 4; ++mt)
                 #pragma unroll
@@ -118,11 +155,10 @@ __global__ void gemm_amper(const half* __restrict__ gA,   // [M][K]
                           "r"(bFrag[nt][0]), "r"(bFrag[nt][1]),
                           "r"(C[mt][nt][0]), "r"(C[mt][nt][1]));
         }
-        __syncthreads();   // 全部读完才允许下轮覆盖 sA/sB
+        __syncthreads();   // 全部读完本 stage 才允许下轮覆盖它
     }
 
-    // ---------- 3) epilogue: 朴素直接写回 (不合并) ----------
-    // 每线程每 reg 只写 2 个 fp16 (4B), warp 内写 gC 的行错位, 128B 事务浪费
+    // ---------- epilogue: 与 base 相同, 朴素直接写回 (不合并) ----------
     const int q = lane % 4;
     #pragma unroll
     for (int mt = 0; mt < 4; ++mt)
@@ -161,25 +197,27 @@ int main()
     cudaMemcpy(dA, hA, szM * sizeof(half), cudaMemcpyHostToDevice);
     cudaMemcpy(dBT, hBT, szN * sizeof(half), cudaMemcpyHostToDevice);
 
+    const size_t smem_size = NUM_STAGES * 2 * BM * BK * sizeof(half);
+    cudaFuncSetAttribute(gemm_amper, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+
     dim3 grid(N / BN, M / BM);
-    gemm_amper<<<grid, 128>>>(dA, dBT, dC);
+    gemm_amper<<<grid, 128, smem_size>>>(dA, dBT, dC);
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) { fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(err)); return 1; }
 
-    // 计时
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0); cudaEventCreate(&t1);
-    for (int i = 0; i < 10; ++i) gemm_amper<<<grid, 128>>>(dA, dBT, dC);
+    for (int i = 0; i < 10; ++i) gemm_amper<<<grid, 128, smem_size>>>(dA, dBT, dC);
     cudaDeviceSynchronize();
     cudaEventRecord(t0);
-    for (int i = 0; i < 100; ++i) gemm_amper<<<grid, 128>>>(dA, dBT, dC);
+    for (int i = 0; i < 100; ++i) gemm_amper<<<grid, 128, smem_size>>>(dA, dBT, dC);
     cudaEventRecord(t1);
     cudaEventSynchronize(t1);
     float ms = 0;
     cudaEventElapsedTime(&ms, t0, t1);
     double tflops = 2.0 * M * N * K * 100 / (ms * 1e-3) / 1e12;
-    printf("gemm_base: %.3f ms/iter  (%.1f TFLOP/s)\n", ms / 100, tflops);
+    printf("gemm_base_multistage: %.3f ms/iter  (%.1f TFLOP/s)\n", ms / 100, tflops);
 
     cudaMemcpy(hC, dC, szC * sizeof(half), cudaMemcpyDeviceToHost);
 

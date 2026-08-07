@@ -33,7 +33,7 @@
 #define BM 128
 #define BN 128
 #define BK 32              // v12: BK=32 -> 3 stages * 2 * 128*32 * 2B = 48KB/block -> 2 blocks/SM
-#define NUM_STAGES 2        // v13: BK=32 2-stage -> 2*2*128*32*2B = 32KB/block -> 3 blocks/SM (12 warps)
+#define NUM_STAGES 3
 #define NUM_KK 2           // BK / 16 = 2 个 k_block per K-tile
 #define CHUNKS (BK / 8)    // 16B cp.async chunks per row: 4 for BK=32
 #define CHUNKS_PER_THREAD (BM * CHUNKS / 128)
@@ -51,7 +51,12 @@ __device__ __forceinline__ void cp_async_commit_group() { asm volatile("cp.async
 
 __device__ __forceinline__ int swizzled_col(int col_base, int row)
 {
-    return col_base ^ ((row & SWZ_MASK) << 3);
+    // v14: key = (row>>1)&3 而非 (row&3)。BK=32 行宽 64B=16 word, 行 r 与 r+2
+    // 落在同一 16-bank 半区; 原 key (row&3) 使矩阵内偶数行(0,4,2,6)的 key 只有
+    // {0,2,0,2} -> ldmatrix 读 8 行时 0&4、2&6 撞 bank (2-way 冲突)。
+    // (row>>1)&3 使 8 行 key = {0,0,1,1,2,2,3,3}, 偶数/奇数行各取 4 个不同值
+    // -> 矩阵内 8 行落位 8 个不同 bank, 消除 ldmatrix 冲突。
+    return col_base ^ (((row >> 1) & SWZ_MASK) << 3);
 }
 
 __device__ __forceinline__ void issue_ktile_load(
@@ -83,7 +88,10 @@ __device__ __forceinline__ void precompute_ldsm_offsets(
 {
     const int grp   = lane >> 3;
     const int lane7 = lane & 7;
-    const int swz   = (lane7 & SWZ_MASK) << 3;
+    // v14: 与 swizzled_col 一致用 (row>>1)&3。此处 lane7 与真实行 row 满足
+    // row = fr + mOff + lane7 (fr 为 16 的倍数, mOff 为 8 的倍数), 故 row ≡ lane7 (mod 8),
+    // (lane7>>1)&3 == (row>>1)&3, 与 store 侧 de-swizzle 严格一致。
+    const int swz   = ((lane7 >> 1) & SWZ_MASK) << 3;
     #pragma unroll
     for (int kk = 0; kk < NUM_KK; ++kk) {
         const int kslice = kk * 16;
@@ -163,43 +171,34 @@ __device__ __forceinline__ void epilogue(
     // sC 用 padded stride: SC_STRIDE = BN+8 fp16 = 272B = 68 bank
     // 相邻行 bank 偏移 4, 32 lane 均匀分布到 32 bank -> 无冲突
     // 且 272 是 16 的倍数 -> uint4 (128b) 访问对齐
-    // v13: 32KB shared 窗口只能容纳 64 行 (64*272B=17.4KB), 所以 C tile
-    // 的 128 行分两个 band (每个 mwarp 对应 64 行), 经同一窗口分两阶段
-    // 转置后写 GMEM。
     constexpr int SC_STRIDE = BN + 8;
+    // reg -> SMEM (按 MMA fragment layout, padded stride)
     #pragma unroll
-    for (int phase = 0; phase < 2; ++phase) {
-        // reg -> SMEM (按 MMA fragment layout, padded stride)
-        if (mwarp == phase) {
-            #pragma unroll
-            for (int mt = 0; mt < 4; ++mt) {
-                const int row_base = mt * 16 + (lane >> 2);
-                const int row_hi   = row_base + 8;
-                const int col_base_lane = nwarp * 64 + 2 * (lane & 3);
-                #pragma unroll
-                for (int nt = 0; nt < 8; ++nt) {
-                    const int col = col_base_lane + nt * 8;
-                    *reinterpret_cast<uint32_t*>(&sC[row_base * SC_STRIDE + col]) = C[mt][nt][0];
-                    *reinterpret_cast<uint32_t*>(&sC[row_hi   * SC_STRIDE + col]) = C[mt][nt][1];
-                }
-            }
-        }
-        __syncthreads();
-        // SMEM -> reg -> GMEM (128b, padded stride 读); 128 线程读 64 行 band
+    for (int mt = 0; mt < 4; ++mt) {
+        const int row_base = mwarp * 64 + mt * 16 + (lane >> 2);
+        const int row_hi   = row_base + 8;
+        const int col_base_lane = nwarp * 64 + 2 * (lane & 3);
         #pragma unroll
-        for (int b = 0; b < BM >> 4; ++b) {
-            const int row_in_batch = tid >> 4;
-            const int col_chunk    = tid & 15;
-            const int row = b * 8 + row_in_batch;
-            const int col = col_chunk * 8;
-            const uint4 data = *reinterpret_cast<const uint4*>(&sC[row * SC_STRIDE + col]);
-            *reinterpret_cast<uint4*>(&gC[(M0 + phase * 64 + row) * N + N0 + col]) = data;
+        for (int nt = 0; nt < 8; ++nt) {
+            const int col = col_base_lane + nt * 8;
+            *reinterpret_cast<uint32_t*>(&sC[row_base * SC_STRIDE + col]) = C[mt][nt][0];
+            *reinterpret_cast<uint32_t*>(&sC[row_hi   * SC_STRIDE + col]) = C[mt][nt][1];
         }
-        __syncthreads();
+    }
+    __syncthreads();
+    // SMEM -> reg -> GMEM (128b, padded stride 读)
+    #pragma unroll
+    for (int b = 0; b < BM >> 3; ++b) {
+        const int row_in_batch = tid >> 4;
+        const int col_chunk    = tid & 15;
+        const int row = b * 8 + row_in_batch;
+        const int col = col_chunk * 8;
+        const uint4 data = *reinterpret_cast<const uint4*>(&sC[row * SC_STRIDE + col]);
+        *reinterpret_cast<uint4*>(&gC[(M0 + row) * N + N0 + col]) = data;
     }
 }
 
-__global__ void __launch_bounds__(128, 3)
+__global__ void __launch_bounds__(128, 2)
 gemm_amper(const half* __restrict__ gA,
            const half* __restrict__ gBT,
            half* __restrict__ gC)
@@ -259,7 +258,7 @@ gemm_amper(const half* __restrict__ gA,
     }
 
     // ---------- Wait + preload k_block=0 (静态 bank0) ----------
-    asm volatile("cp.async.wait_group 0;");
+    asm volatile("cp.async.wait_group 1;");
     __syncthreads();
 
     FragA aBank[2];
@@ -275,7 +274,7 @@ gemm_amper(const half* __restrict__ gA,
     do {                                                                               \
         if (kk == NUM_KK - 1) {                                                        \
             compute_stage = (compute_stage + 1) % NUM_STAGES;                          \
-            asm volatile("cp.async.wait_group 0;");                                    \
+            asm volatile("cp.async.wait_group 1;");                                    \
             __syncthreads();                                                           \
         }                                                                              \
         {                                                                              \
@@ -362,7 +361,7 @@ int main()
     float ms = 0;
     cudaEventElapsedTime(&ms, t0, t1);
     double tflops = 2.0 * M * N * K * 100 / (ms * 1e-3) / 1e12;
-    printf("v7 kernel: %.3f ms/iter  (%.1f TFLOP/s)\n", ms / 100, tflops);
+    printf("gemm_finial: %.3f ms/iter  (%.1f TFLOP/s)\n", ms / 100, tflops);
 
     cudaMemcpy(hC, dC, szC * sizeof(half), cudaMemcpyDeviceToHost);
 
