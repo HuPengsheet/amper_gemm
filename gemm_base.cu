@@ -122,7 +122,7 @@ __global__ void gemm_amper(const half* __restrict__ gA,   // [M][K]
     }
 
     // ---------- 3) epilogue: 朴素直接写回 (不合并) ----------
-    // 每线程每 reg 只写 2 个 fp16 (4B), warp 内写 gC 的行错位, 128B 事务浪费
+    // 每 reg 的 2 个 fp16 打包成 1 个 32b store; warp 内仍 8 行错位, 128B 事务浪费
     const int q = lane % 4;
     #pragma unroll
     for (int mt = 0; mt < 4; ++mt)
@@ -131,10 +131,9 @@ __global__ void gemm_amper(const half* __restrict__ gA,   // [M][K]
             const int row = M0 + mwarp * 64 + mt * 16 + lane / 4;
             const int col = N0 + nwarp * 64 + nt * 8 + 2 * q;
             half* p = &gC[row * N + col];
-            p[0] = __ushort_as_half((unsigned short)(C[mt][nt][0] & 0xFFFFu));
-            p[1] = __ushort_as_half((unsigned short)(C[mt][nt][0] >> 16));
-            p[8 * N]   = __ushort_as_half((unsigned short)(C[mt][nt][1] & 0xFFFFu));
-            p[8 * N + 1] = __ushort_as_half((unsigned short)(C[mt][nt][1] >> 16));
+            // 寄存器 C[..][0] 低16b->p[0], 高16b->p[1], 整 32b 一次写 (小端天然对应)
+            *(uint32_t*)p = C[mt][nt][0];             // 行内 4B
+            *(uint32_t*)(p + 8 * N) = C[mt][nt][1];   // row+8 的 4B
         }
 }
 
