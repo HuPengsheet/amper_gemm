@@ -61,55 +61,67 @@ __global__ void gemm_amper(const half* __restrict__ gA,   // [M][K]
 
     uint32_t C[4][8][2] = {};
 
-    // per-thread cp.async 源指针 (k0=0 base, 含 M0/N0 偏移)
-    const half* srcA[CHUNKS_PER_THREAD];
-    const half* srcB[CHUNKS_PER_THREAD];
+    // per-thread 全局源偏移 (32-bit half 元素偏移, 不含 k0).
+    // 存 32-bit 偏移而非 64-bit 指针: 否则 prologue 预存指针那一步就要吃掉一套 LEA(64-bit 地址合成).
+    int offA[CHUNKS_PER_THREAD];
+    int offB[CHUNKS_PER_THREAD];
     #pragma unroll
     for (int idx = 0; idx < CHUNKS_PER_THREAD; ++idx) {
         const int i     = tid + idx * 128;
         const int row   = i / CHUNKS;
         const int chunk = i % CHUNKS;
-        srcA[idx] = &gA[(M0 + row) * K] + chunk * 8;
-        srcB[idx] = &gBT[(N0 + row) * K] + chunk * 8;
+        offA[idx] = (M0 + row) * K + chunk * 8;
+        offB[idx] = (N0 + row) * K + chunk * 8;
     }
 
     const uint32_t sA0 = (uint32_t)__cvta_generic_to_shared(sA_stages);
     const uint32_t sB0 = (uint32_t)__cvta_generic_to_shared(sB_stages);
     constexpr uint32_t STAGE_BYTES = BM * BK * 2;
 
-    // 发出一个 K-tile 的 global->shared 拷贝到 stage st (无 swizzle, 与 base 同布局)
-    auto issue_load = [&](int st, int k_tile) {
-        const uint32_t dA = sA0 + st * STAGE_BYTES;
-        const uint32_t dB = sB0 + st * STAGE_BYTES;
+    // 发出一个 K-tile 的 global->shared 拷贝到给定 smem 基址 (无 swizzle, 与 base 同布局)
+    auto issue_load = [&](uint32_t dA, uint32_t dB, int k_tile) {
         const int k0 = k_tile * BK;
         #pragma unroll
         for (int idx = 0; idx < CHUNKS_PER_THREAD; ++idx) {
             const int i     = tid + idx * 128;
             const int row   = i / CHUNKS;
             const int chunk = i % CHUNKS;
-            cp_async_16(dA + (uint32_t)(row * BK + chunk * 8) * 2, srcA[idx] + k0);
-            cp_async_16(dB + (uint32_t)(row * BK + chunk * 8) * 2, srcB[idx] + k0);
+            cp_async_16(dA + (uint32_t)(row * BK + chunk * 8) * 2, &gA[offA[idx] + k0]);
+            cp_async_16(dB + (uint32_t)(row * BK + chunk * 8) * 2, &gBT[offB[idx] + k0]);
         }
         cp_async_commit_group();
     };
 
-    // Prologue: 提前 issue 前 NUM_STAGES-1 个 K-tile, 流水填满
+    // 3 个 stage 的 smem 基址边界 (STAGE_BYTES 为 2 的幂, 前进只需 IADD + 回卷比较)
+    const uint32_t sA_end = sA0 + NUM_STAGES * STAGE_BYTES;
+    const uint32_t sB_end = sB0 + NUM_STAGES * STAGE_BYTES;
+
+    // Prologue: 提前 issue 前 NUM_STAGES-1 个 K-tile, 流水填满 (s 为展开常量, 无运行时乘)
     #pragma unroll
-    for (int s = 0; s < NUM_STAGES - 1; ++s) issue_load(s, s);
+    for (int s = 0; s < NUM_STAGES - 1; ++s)
+        issue_load(sA0 + s * STAGE_BYTES, sB0 + s * STAGE_BYTES, s);
     cp_async_wait_near();   // 等最早的组 (tile 0) 到, 保留最新一组在途
     __syncthreads();
 
+    // 滚动基址: baseX = 当前计算 stage, loadX = 下一待装载 stage.
+    // 用 IADD + 回卷比较替代 %NUM_STAGES 与 *STAGE_BYTES, 省掉每 tile 的取模/乘法整数指令.
+    uint32_t baseA = sA0;
+    uint32_t baseB = sB0;
+    uint32_t loadA = sA0 + (NUM_STAGES - 1) * STAGE_BYTES;
+    uint32_t loadB = sB0 + (NUM_STAGES - 1) * STAGE_BYTES;
+
     for (int k_tile = 0; k_tile < NUM_K; ++k_tile) {
-        const int cur_stage = k_tile % NUM_STAGES;
         // issue 下一批: tile k_tile + (NUM_STAGES-1) 进刚被释放的 stage
         const int nk = k_tile + (NUM_STAGES - 1);
-        if (nk < NUM_K) issue_load(nk % NUM_STAGES, nk);
+        if (nk < NUM_K) {
+            issue_load(loadA, loadB, nk);
+            loadA += STAGE_BYTES; if (loadA == sA_end) loadA = sA0;
+            loadB += STAGE_BYTES; if (loadB == sB_end) loadB = sB0;
+        }
         cp_async_wait_near();   // 等本 tile 的组完成 (它是当前最旧的)
         __syncthreads();
 
-        // ---------- 计算: 与 base 逐字节相同, 只把 smem 基址加上 stage 偏移 ----------
-        const uint32_t baseA = sA0 + cur_stage * STAGE_BYTES;
-        const uint32_t baseB = sB0 + cur_stage * STAGE_BYTES;
+        // ---------- 计算: 与 base 逐字节相同, smem 基址直接用滚动变量 baseA/baseB ----------
         #pragma unroll
         for (int kk = 0; kk < NUM_KK; ++kk) {
             const int kslice = kk * 16;
@@ -156,6 +168,8 @@ __global__ void gemm_amper(const half* __restrict__ gA,   // [M][K]
                           "r"(C[mt][nt][0]), "r"(C[mt][nt][1]));
         }
         __syncthreads();   // 全部读完本 stage 才允许下轮覆盖它
+        baseA += STAGE_BYTES; if (baseA == sA_end) baseA = sA0;
+        baseB += STAGE_BYTES; if (baseB == sB_end) baseB = sB0;
     }
 
     // ---------- epilogue: 与 base 相同, 朴素直接写回 (不合并) ----------
@@ -167,10 +181,9 @@ __global__ void gemm_amper(const half* __restrict__ gA,   // [M][K]
             const int row = M0 + mwarp * 64 + mt * 16 + lane / 4;
             const int col = N0 + nwarp * 64 + nt * 8 + 2 * q;
             half* p = &gC[row * N + col];
-            p[0] = __ushort_as_half((unsigned short)(C[mt][nt][0] & 0xFFFFu));
-            p[1] = __ushort_as_half((unsigned short)(C[mt][nt][0] >> 16));
-            p[8 * N]   = __ushort_as_half((unsigned short)(C[mt][nt][1] & 0xFFFFu));
-            p[8 * N + 1] = __ushort_as_half((unsigned short)(C[mt][nt][1] >> 16));
+            // 与 base 相同: 每个 reg (2 个 fp16) 打包成 1 次 32b store
+            *(uint32_t*)p = C[mt][nt][0];             // 行内 4B
+            *(uint32_t*)(p + 8 * N) = C[mt][nt][1];   // row+8 的 4B
         }
 }
 
